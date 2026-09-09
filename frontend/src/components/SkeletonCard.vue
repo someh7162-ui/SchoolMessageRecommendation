@@ -1,0 +1,1 @@
+<template><article class="skeleton-card"><div class="skeleton-line short"></div><div class="skeleton-line title"></div><div class="skeleton-line"></div><div class="skeleton-line"></div><div class="skeleton-line meta"></div></article></template>

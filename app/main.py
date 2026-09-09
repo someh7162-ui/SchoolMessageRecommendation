@@ -1,5 +1,5 @@
 from __future__ import annotations
-import base64, hashlib, hmac, json, os, secrets, uuid
+import base64, hashlib, hmac, json, os, secrets, uuid, re, logging, math
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -12,8 +12,12 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, MetaData, Table, Column, Integer, String, Text, Boolean, select, inspect, text
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 ROOT=Path(__file__).resolve().parents[1]; STATIC=ROOT/'frontend'
 load_dotenv(ROOT / '.env')
+logging.basicConfig(level=os.getenv('LOG_LEVEL','INFO'))
+logger=logging.getLogger(__name__)
 SECRET=os.getenv('JWT_SECRET','dev-secret')
 def url():
     if os.getenv('DATABASE_URL'): return os.getenv('DATABASE_URL')
@@ -21,7 +25,7 @@ def url():
     return f"sqlite:///{os.getenv('CAMPUS_DB',ROOT/'campus.db')}"
 engine=create_engine(url(),future=True,pool_pre_ping=True); md=MetaData()
 users=Table('users',md,Column('id',Integer,primary_key=True),Column('username',String(80),unique=True),Column('name',String(120)),Column('password_hash',String(255)),Column('role',String(30)),Column('college',String(120)),Column('major',String(120)),Column('grade',String(30)),Column('interests',Text,default='[]'),Column('onboarding_completed',Boolean,default=False),Column('is_active',Boolean,default=True),Column('created_at',String(40)))
-contents=Table('contents',md,Column('id',Integer,primary_key=True,autoincrement=True),Column('title',String(200)),Column('body',Text),Column('content_type',String(40)),Column('publisher_id',Integer),Column('target_roles',Text,default='[]'),Column('target_colleges',Text,default='[]'),Column('target_grades',Text,default='[]'),Column('tags',Text,default='[]'),Column('start_time',String(40)),Column('end_time',String(40)),Column('publish_time',String(40)),Column('status',String(30),default='published'))
+contents=Table('contents',md,Column('id',Integer,primary_key=True,autoincrement=True),Column('title',String(200)),Column('body',Text),Column('summary',Text),Column('content_type',String(40)),Column('publisher_id',Integer),Column('target_roles',Text,default='[]'),Column('target_colleges',Text,default='[]'),Column('target_majors',Text,default='[]'),Column('target_grades',Text,default='[]'),Column('tags',Text,default='[]'),Column('source_url',String(500)),Column('source_site',String(200)),Column('source_department',String(200)),Column('source_id',String(200)),Column('content_hash',String(64)),Column('crawl_time',String(40)),Column('updated_at',String(40)),Column('start_time',String(40)),Column('end_time',String(40)),Column('publish_time',String(40)),Column('status',String(30),default='published'))
 events=Table('user_events',md,Column('id',Integer,primary_key=True,autoincrement=True),Column('user_id',Integer),Column('content_id',Integer),Column('event_type',String(40)),Column('source',String(40)),Column('timestamp',String(40)))
 feedbacks=Table('feedbacks',md,Column('id',Integer,primary_key=True,autoincrement=True),Column('user_id',Integer),Column('content_id',Integer),Column('feedback_type',String(40)),Column('reason',Text),Column('created_at',String(40)))
 modules=Table('interest_modules',md,Column('id',Integer,primary_key=True,autoincrement=True),Column('name',String(80),unique=True),Column('description',String(255)),Column('icon',String(20)),Column('recommended_grades',Text),Column('recommended_roles',Text),Column('sort_order',Integer))
@@ -44,6 +48,18 @@ def cpub(r):
     d=dict(r)
     for k in ('target_roles','target_colleges','target_grades','tags'): d[k]=pj(d.get(k))
     return d
+def parse_dt(v):
+    if not v: return None
+    try: return datetime.fromisoformat(str(v).replace('Z','+00:00')).astimezone(timezone.utc)
+    except Exception: return None
+def deadline_info(v):
+    d=parse_dt(v); n=datetime.now(timezone.utc)
+    if not d: return 'normal',None,0.0
+    days=(d-n).total_seconds()/86400
+    if days < 0: return 'expired',math.floor(days),0.0
+    if days <= 1: return 'today',math.ceil(days),1.0
+    if days <= 3: return 'ending_soon',math.ceil(days),0.7
+    return 'normal',math.ceil(days),0.0
 SEEDS=['新生入学','校园生活','社团活动','志愿服务','学习成长','创新创业','奖助学金','心理健康','就业实习','考研升学','活动运营','班级管理']
 def init_db():
     with engine.begin() as c:
@@ -53,12 +69,16 @@ def init_db():
             cols={x['name'] for x in inspect(c).get_columns('users')}
             for name, ddl in {'username':'VARCHAR(80)','password_hash':'VARCHAR(255)','onboarding_completed':'BOOLEAN DEFAULT 0','is_active':'BOOLEAN DEFAULT 1'}.items():
                 if name not in cols: c.execute(text(f'ALTER TABLE users ADD COLUMN {name} {ddl}'))
-        if inspect(c).has_table('contents') and 'target_grades' not in {x['name'] for x in inspect(c).get_columns('contents')}: c.execute(text("ALTER TABLE contents ADD COLUMN target_grades TEXT DEFAULT '[]'"))
+        if inspect(c).has_table('contents'):
+            cols={x['name'] for x in inspect(c).get_columns('contents')}
+            additions={'target_grades':'TEXT','summary':'TEXT','target_majors':'TEXT','source_url':'VARCHAR(500)','source_site':'VARCHAR(200)','source_department':'VARCHAR(200)','source_id':'VARCHAR(200)','content_hash':'VARCHAR(64)','crawl_time':'VARCHAR(40)','updated_at':'VARCHAR(40)'}
+            for name,ddl in additions.items():
+                if name not in cols: c.execute(text(f'ALTER TABLE contents ADD COLUMN {name} {ddl}'))
         if c.execute(select(modules.c.id)).first() is None: c.execute(modules.insert(),[{'name':n,'description':f'{n}相关校园信息','icon':'✦','recommended_grades':jt(['大一'] if n=='新生入学' else (['大四'] if n in ['就业实习','考研升学'] else [])),'recommended_roles':jt(['counselor'] if n=='班级管理' else (['organizer'] if n=='活动运营' else ['student'])),'sort_order':i} for i,n in enumerate(SEEDS)])
         if c.execute(select(users.c.id).limit(1)).first() is None:
             c.execute(users.insert(),[{'username':'legacy_admin','name':'历史管理员','password_hash':None,'role':'admin','college':'','major':'','grade':'','interests':'[]','onboarding_completed':False,'is_active':False,'created_at':now()}])
             p=c.execute(select(users.c.id)).scalar_one(); data=[('新生入学报到指南','大一新生报到流程、校园卡领取、宿舍入住和军训安排。','notice',['student'],['大一'],['新生入学','校园生活']),('大四就业与实习双选会','面向大四学生的秋季就业双选会，提供简历诊断和现场面试。','activity',['student'],['大四'],['就业实习','就业']),('校园创新创业讲座','分享项目孵化、商业计划书和竞赛经验。','lecture',['student'],[],['创新创业']),('奖学金申请通知','本年度奖学金申请开始，请提交申请材料。','notice',['student'],[],['奖助学金']),('校园志愿服务招募','招募志愿者参与校园志愿服务。','activity',['student'],[],['志愿服务'])]
-            c.execute(contents.insert(),[{'title':t,'body':b,'content_type':typ,'publisher_id':p,'target_roles':jt(r),'target_colleges':'[]','target_grades':jt(g),'tags':jt(tags),'publish_time':now(),'end_time':(datetime.now(timezone.utc)+timedelta(days=30)).isoformat(),'status':'published'} for t,b,typ,r,g,tags in data])
+            c.execute(contents.insert(),[{'title':t,'body':b,'summary':b[:160],'content_type':typ,'publisher_id':p,'target_roles':jt(r),'target_colleges':'[]','target_majors':'[]','target_grades':jt(g),'tags':jt(tags),'publish_time':now(),'end_time':(datetime.now(timezone.utc)+timedelta(days=30)).isoformat(),'status':'published'} for t,b,typ,r,g,tags in data])
 init_db()
 class Reg(BaseModel): username:str=Field(min_length=3,max_length=40,pattern=r'^[A-Za-z0-9_]+$'); password:str=Field(min_length=8); name:str; role:str; college:str=''; major:str=''; grade:str=''
 class Login(BaseModel): username:str; password:str
@@ -108,12 +128,26 @@ def save_interests(x:Interests,u=Depends(current)):
 @app.get('/recommendations')
 def recommendations(u=Depends(current)):
     if not u['onboarding_completed']: return {'onboarding_required':True,'items':[]}
-    with engine.connect() as c: rs=c.execute(select(contents).where(contents.c.status=='published')).mappings().all()
+    with engine.connect() as c: rs=c.execute(select(contents).where(contents.c.status=='published')).mappings().all(); evs=c.execute(select(events).where(events.c.user_id==u['id'])).mappings().all()
     interests=set(pj(u['interests'])); out=[]
     for r in rs:
-        roles,grades,tags=pj(r['target_roles']),pj(r['target_grades']),pj(r['tags'])
-        if (roles and u['role'] not in roles) or (grades and u['grade'] not in grades): continue
-        s=len(interests&set(tags))/max(1,len(interests))+.25*(u['grade'] in grades if grades else 0)+.2*(u['role'] in roles if roles else .5); d=cpub(r); d.update(score=round(s,4),reason=f"与你的{u['grade']}年级和兴趣模块匹配",deadline=r['end_time']); out.append(d)
+        roles,grades,tags,colleges,majors=pj(r['target_roles']),pj(r['target_grades']),pj(r['tags']),pj(r.get('target_colleges')),pj(r.get('target_majors'))
+        if (roles and u['role'] not in roles) or (grades and u['grade'] not in grades) or (colleges and u.get('college') not in colleges) or (majors and u.get('major') not in majors): continue
+        status,days,urg=deadline_info(r.get('end_time'))
+        if status=='expired': continue
+        positive=set(); negative=set()
+        for e in evs:
+            if e['event_type']=='dismiss': negative.update(tags)
+            elif e['event_type'] in ('favorite','register','share','click','view'):
+                rr=next((z for z in rs if z['id']==e['content_id']),None)
+                if rr: positive.update(pj(rr['tags']))
+        content_score=len(interests&set(tags))/max(1,len(interests)); profile_score=len(positive&set(tags))/max(1,len(positive)) if positive else 0
+        if negative&set(tags): profile_score-=0.3
+        freshness=1.0
+        pd=parse_dt(r.get('publish_time'))
+        if pd: freshness=max(0.0,1-(datetime.now(timezone.utc)-pd).days/365)
+        score=max(0.0,0.55*content_score+0.2*profile_score+0.15*freshness+0.1*urg)
+        d=cpub(r); matched=list((interests|positive)&set(tags)); reason='与你关注的'+('、'.join(matched) if matched else '校园信息')+'相关'; d.update(score=round(score,4),reason=reason,matched_tags=matched,score_detail={'content':round(content_score,3),'profile':round(profile_score,3),'freshness':round(freshness,3),'urgency':urg},deadline=r.get('end_time'),deadline_status=status,days_remaining=days); out.append(d)
     return {'onboarding_required':False,'items':sorted(out,key=lambda x:x['score'],reverse=True)}
 @app.post('/events')
 def event(x:Event,u=Depends(current)):
@@ -124,8 +158,13 @@ def register_activity(content_id:int,u=Depends(current)): event(Event(content_id
 @app.post('/rag/ask')
 def rag(x:Ask,u=Depends(current)):
     with engine.connect() as c:rs=c.execute(select(contents).where(contents.c.status=='published')).mappings().all()
-    ranked=sorted(rs,key=lambda r:sum(x.question[i:i+2] in (r['title']+r['body']) for i in range(max(0,len(x.question)-1))),reverse=True)[:1]
-    if not ranked:return {'answer':'未找到可靠的校园资料','sources':[]}
+    if not rs:return {'answer':'当前校园资料库中暂无可靠信息。','sources':[]}
+    docs=[f"{r['title']} {r.get('summary') or ''} {r['body']} {' '.join(pj(r.get('tags')))}" for r in rs]
+    try:
+        vec=TfidfVectorizer(analyzer='char',ngram_range=(2,4),min_df=1); mat=vec.fit_transform(docs); sims=cosine_similarity(vec.transform([x.question]),mat)[0]
+    except Exception as ex: logger.warning('RAG vectorization failed: %s',ex); sims=[0]*len(rs)
+    order=sorted(range(len(rs)),key=lambda i:sims[i],reverse=True); ranked=[rs[i] for i in order[:5]]; scores=[float(sims[i]) for i in order[:5]]
+    if not ranked or max(scores,default=0)<float(os.getenv('RAG_MIN_SCORE','0.02')): return {'answer':'当前校园资料库中暂无可靠信息。','sources':[],'model':'local-retrieval'}
     local=f"根据《{ranked[0]['title']}》：{ranked[0]['body']}"
     answer=local; model='local-retrieval'
     if os.getenv('DEEPSEEK_API_KEY'):
@@ -134,7 +173,7 @@ def rag(x:Ask,u=Depends(current)):
         req=urllib.request.Request(os.getenv('DEEPSEEK_BASE_URL','https://api.deepseek.com').rstrip('/')+'/chat/completions',data=payload,headers={'Authorization':'Bearer '+os.getenv('DEEPSEEK_API_KEY'),'Content-Type':'application/json'},method='POST')
         try:
             with urllib.request.urlopen(req,timeout=15) as resp: answer=json.loads(resp.read().decode())['choices'][0]['message']['content']; model=os.getenv('DEEPSEEK_MODEL','deepseek-chat')
-        except Exception: pass
-    return {'answer':answer,'sources':[{'content_id':ranked[0]['id'],'title':ranked[0]['title']}],'model':model}
+        except Exception as ex: logger.warning('DeepSeek RAG call failed: %s',ex)
+    return {'answer':answer,'sources':[{'content_id':r['id'],'title':r['title'],'source_department':r.get('source_department'),'source_url':r.get('source_url'),'similarity_score':round(scores[i],4)} for i,r in enumerate(ranked)],'model':model}
 @app.get('/health')
 def health(): return {'status':'ok','database':engine.url.get_backend_name()}

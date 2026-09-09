@@ -37,6 +37,18 @@ uv run uvicorn app.main:app --reload
 
 未配置 Key 时，RAG 接口返回本地检索结果，不会暴露密钥或阻塞系统使用。
 
+## 导入校园资料（含 PDF）
+
+支持 JSON、NDJSON、CSV 和 PDF；PDF 会按页切分写入 `contents`，自动生成
+`content_hash`、来源字段并去重，可重复执行：
+
+```powershell
+uv run python scripts/import_campus_data.py "data/新疆工程学院公开校内信息汇总.pdf"
+```
+
+RAG 使用 TF-IDF 字符 n-gram 检索最多 5 条资料，`RAG_MIN_SCORE`（默认 `0.02`）
+用于拒答低相关问题，返回结果包含来源链接、部门和相似度。
+
 ## 主要流程
 
 1. 注册用户名、密码、角色、学院、年级。
