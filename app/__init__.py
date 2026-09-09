@@ -1,0 +1,1 @@
+"""Campus recommendation application."""

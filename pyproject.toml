@@ -1,0 +1,21 @@
+[project]
+name = "campus-recommender"
+version = "0.1.0"
+description = "Campus information hybrid recommendation system"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.30.0",
+  "pydantic>=2.8.0",
+  "scikit-learn>=1.5.0",
+  "sqlalchemy>=2.0.0",
+  "pymysql>=1.1.0",
+  "pyjwt>=2.8.0",
+  "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0", "httpx2>=0.1.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
